@@ -24,6 +24,7 @@ const startAndWatchJob = (job: Job) => {
 
     //log to path
     const logPath = path.join(trainingFolder, 'log.txt');
+    const stderrPath = path.join(trainingFolder, 'stderr.log');
 
     try {
       // if the log path exists, move it to a folder called logs and rename it {num}_log.txt, looking for the highest num
@@ -40,6 +41,19 @@ const startAndWatchJob = (job: Job) => {
         }
 
         fs.renameSync(logPath, path.join(logsFolder, `${num}_log.txt`));
+      }
+      if (fs.existsSync(stderrPath)) {
+        const logsFolder = path.join(trainingFolder, 'logs');
+        if (!fs.existsSync(logsFolder)) {
+          fs.mkdirSync(logsFolder, { recursive: true });
+        }
+
+        let num = 0;
+        while (fs.existsSync(path.join(logsFolder, `${num}_stderr.log`))) {
+          num++;
+        }
+
+        fs.renameSync(stderrPath, path.join(logsFolder, `${num}_stderr.log`));
       }
     } catch (e) {
       console.error('Error moving log file:', e);
@@ -86,6 +100,13 @@ const startAndWatchJob = (job: Job) => {
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
       CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
       IS_AI_TOOLKIT_UI: '1',
+      // ROCm: pass through only if parent already has them set. run.py
+      // sets safe defaults when they're absent, so don't shadow it here.
+      ...(process.env.AMD_SERIALIZE_KERNEL && { AMD_SERIALIZE_KERNEL: process.env.AMD_SERIALIZE_KERNEL }),
+      ...(process.env.TORCH_USE_HIP_DSA && { TORCH_USE_HIP_DSA: process.env.TORCH_USE_HIP_DSA }),
+      ...(process.env.HSA_ENABLE_SDMA && { HSA_ENABLE_SDMA: process.env.HSA_ENABLE_SDMA }),
+      ...(process.env.PYTORCH_ROCM_ALLOC_CONF && { PYTORCH_ROCM_ALLOC_CONF: process.env.PYTORCH_ROCM_ALLOC_CONF }),
+      ...(process.env.HIP_LAUNCH_BLOCKING && { HIP_LAUNCH_BLOCKING: process.env.HIP_LAUNCH_BLOCKING }),
     };
 
     // HF_TOKEN
@@ -100,6 +121,10 @@ const startAndWatchJob = (job: Job) => {
     try {
       let subprocess;
 
+      // Capture child stderr to a file so torch/ROCm tracebacks (which go to
+      // stderr, not the --log file) are recoverable after the job dies.
+      const stderrFd = fs.openSync(stderrPath, 'a');
+
       if (isWindows) {
         // Spawn Python directly on Windows so the process can survive parent exit
         subprocess = spawn(pythonPath, args, {
@@ -110,19 +135,26 @@ const startAndWatchJob = (job: Job) => {
           cwd: TOOLKIT_ROOT,
           detached: true,
           windowsHide: true,
-          stdio: 'ignore', // don't tie stdio to parent
+          stdio: ['ignore', 'ignore', stderrFd],
         });
       } else {
-        // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
         subprocess = spawn(pythonPath, args, {
           detached: true,
-          stdio: 'ignore',
+          stdio: ['ignore', 'ignore', stderrFd],
           env: {
             ...process.env,
             ...additionalEnv,
           },
           cwd: TOOLKIT_ROOT,
         });
+        // Child inherits the fd; release our handle once the spawn settles.
+        setTimeout(() => {
+          try {
+            fs.closeSync(stderrFd);
+          } catch {
+            // already closed
+          }
+        }, 100);
       }
 
       // Save the PID to the database and a file for future management (stop/inspect)
