@@ -379,90 +379,96 @@ async function getRocmGpuStats(isWindows: boolean) {
       return [];
     }
 
+    // Resolve column positions by header name — rocm-smi's column layout
+    // varies between versions (ROCm 7.x emits 34 columns; older patched
+    // builds emit 18 or 25). Looking up by name is portable; hardcoded
+    // indices are not.
+    const header = parseCSVLine(lines[headerIndex]).map(h => h.toLowerCase());
+    const findCol = (...needles: string[]): number => {
+      for (const needle of needles) {
+        const n = needle.toLowerCase();
+        const i = header.findIndex(h => h.includes(n));
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+
+    const colDevice = findCol('device');
+    const colDeviceName = header.findIndex(h => h === 'device name' || h.startsWith('device name'));
+    const colTemp = findCol('temperature (sensor edge)', 'temperature');
+    const colMclkSpeed = findCol('mclk clock speed');
+    const colSclkSpeed = findCol('sclk clock speed');
+    const colPower = findCol('graphics package power', 'power (w)');
+    const colUsage = findCol('gpu use (%)', 'gpu use');
+    const colVramTotal = findCol('vram total memory');
+    const colVramUsed = findCol('vram total used memory');
+    const colCardSeries = findCol('card series');
+    const colCardModel = findCol('card model');
+    const colCardVendor = findCol('card vendor');
+    const colCardSku = findCol('card sku');
+
     const gpus = lines.slice(headerIndex + 1).map((line, idx) => {
       const fields = parseCSVLine(line);
+      const get = (i: number): string => (i >= 0 && i < fields.length ? fields[i] : '');
 
-      // rocm-smi CSV has two known layouts. Newer (~25 fields) puts Temperature at index 6;
-      // older (~18 fields) puts it at index 2. Detect by field count.
-      const isNewFormat = fields.length >= 25;
-      while (fields.length < 25) fields.push('');
-
-      const tempFieldIdx = isNewFormat ? 6 : 2;
-      const mclkFieldIdx = isNewFormat ? 7 : 3;
-      const sclkFieldIdx = isNewFormat ? 9 : 5;
-      const powerFieldIdx = isNewFormat ? 13 : 9;
-      const usageFieldIdx = isNewFormat ? 14 : 10;
-      const memTotalFieldIdx = isNewFormat ? 17 : 12;
-      const memUsedFieldIdx = isNewFormat ? 18 : 13;
-      const cardSkuFieldIdx = isNewFormat ? 22 : 17;
-      const cardModelFieldIdx = isNewFormat ? 20 : 15;
-      const cardNameFieldIdx = isNewFormat ? 1 : -1;
-
-      const deviceName = fields[0] || '';
+      // Device index from "card0" / "card1" etc.
+      const deviceName = get(colDevice);
       const deviceMatch = deviceName.match(/\d+/);
       const index = deviceMatch ? parseInt(deviceMatch[0]) : idx;
 
       // Temperature (°C)
       let temperature = 0;
-      const tempStr = fields[tempFieldIdx] || '';
-      const tempVal = parseRocmValue(tempStr);
+      const tempVal = parseRocmValue(get(colTemp));
       if (tempVal >= 0 && tempVal <= 200) temperature = tempVal;
 
       // GPU use (%)
-      let gpuUtil = parseRocmValue(fields[usageFieldIdx]);
+      let gpuUtil = parseRocmValue(get(colUsage));
       gpuUtil = Math.max(0, Math.min(100, gpuUtil));
 
-      // Memory (rocm-smi reports VRAM in bytes for this query)
-      let memoryTotal = parseRocmValue(fields[memTotalFieldIdx]);
-      let memoryUsed = parseRocmValue(fields[memUsedFieldIdx]);
+      // Memory (bytes from rocm-smi for the VRAM query)
+      let memoryTotal = parseRocmValue(get(colVramTotal));
+      let memoryUsed = parseRocmValue(get(colVramUsed));
       if (memoryTotal < 0 || isNaN(memoryTotal)) memoryTotal = 0;
       if (memoryUsed < 0 || isNaN(memoryUsed)) memoryUsed = 0;
       if (memoryUsed > memoryTotal) memoryUsed = memoryTotal;
       const memoryFree = Math.max(0, memoryTotal - memoryUsed);
 
-      // Power (W): tolerate "(123.4 W)" / "123.45" / clock-shaped junk in same column
+      // Power (W)
       let powerDraw = 0;
-      const powerDrawStr = fields[powerFieldIdx] || '';
-      if (powerDrawStr && !powerDrawStr.toLowerCase().includes('mhz') && powerDrawStr !== 'N/A') {
-        const m = powerDrawStr.match(/(\d+\.?\d*)/);
+      const powerStr = get(colPower);
+      if (powerStr && !powerStr.toLowerCase().includes('mhz') && powerStr !== 'N/A') {
+        const m = powerStr.match(/(\d+\.?\d*)/);
         if (m) {
           const parsed = parseFloat(m[1]);
           if (parsed >= 0 && parsed <= 1000) powerDraw = parsed;
         }
       }
 
-      // Clocks (MHz): "(1472Mhz)" or raw number
-      const mclkMatch = (fields[mclkFieldIdx] || '').match(/(\d+)/);
-      const sclkMatch = (fields[sclkFieldIdx] || '').match(/(\d+)/);
+      // Clocks (MHz) — formatted as "(1472Mhz)"
+      const mclkMatch = get(colMclkSpeed).match(/(\d+)/);
+      const sclkMatch = get(colSclkSpeed).match(/(\d+)/);
       let clockGraphics = sclkMatch ? parseInt(sclkMatch[1]) : 0;
       let clockMemory = mclkMatch ? parseInt(mclkMatch[1]) : 0;
-      // Some rocm-smi builds report in Hz when it overflows — fold back to MHz.
       if (clockGraphics > 10000) clockGraphics = Math.round(clockGraphics / 1000000);
       if (clockMemory > 10000) clockMemory = Math.round(clockMemory / 1000000);
       if (clockGraphics < 0 || clockGraphics > 5000) clockGraphics = 0;
       if (clockMemory < 0 || clockMemory > 3000) clockMemory = 0;
 
-      // Name: prefer Card SKU, then Card model, then Device Name, then fall back to "AMD GPU N".
-      const cardSku = (fields[cardSkuFieldIdx] || '').trim();
-      const cardModel = (fields[cardModelFieldIdx] || '').trim();
-      const deviceNameField = cardNameFieldIdx >= 0 ? (fields[cardNameFieldIdx] || '').trim() : '';
-      const cardVendor = (fields[16] || '').trim();
-      const gpuId = (fields[1] || '').trim();
-
-      let name = '';
+      // Name: prefer Device Name (most readable), then Card Series, then Card Model.
       const looksLikeId = (s: string) => !s || s.startsWith('0x') || /^\d+$/.test(s);
-      if (!looksLikeId(cardSku) && cardSku !== gpuId) {
-        name = cardSku;
-      } else if (!looksLikeId(cardModel) && cardModel !== gpuId) {
-        name = cardModel;
-      } else if (deviceNameField && !looksLikeId(deviceNameField)) {
-        name = deviceNameField;
-      } else if (cardVendor.includes('AMD') || cardVendor.includes('Advanced Micro Devices')) {
-        name = `AMD GPU ${index}`;
-      } else {
-        name = `GPU ${index}`;
+      const candidates = [
+        get(colDeviceName),
+        get(colCardSeries),
+        get(colCardModel),
+        get(colCardSku),
+      ];
+      let name = candidates.find(c => c && !looksLikeId(c)) || '';
+      if (!name) {
+        const vendor = get(colCardVendor);
+        name = vendor.includes('AMD') || vendor.includes('Advanced Micro Devices')
+          ? `AMD GPU ${index}`
+          : `GPU ${index}`;
       }
-      if (/^\d+$/.test(name)) name = `AMD GPU ${index}`;
 
       // Normalize memory units. rocm-smi reports VRAM in bytes for --showmeminfo, but
       // older / patched builds sometimes emit MB or GB. Detect by magnitude.
