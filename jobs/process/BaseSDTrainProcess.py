@@ -1633,6 +1633,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
         text_encoder = self.sd.text_encoder
         noise_scheduler = self.sd.noise_scheduler
 
+        # --- ROCm/HIP xformers kludge -----------------------------------
+        # On AMD we silently rewrite `xformers: true` -> SDPA. This is *not*
+        # a perf or correctness preference; it is a workaround for the
+        # genuinely broken state of the ROCm xformers wheels as of 2026-05:
+        #   - The wheel at download.pytorch.org/whl/rocm7.2
+        #     (xformers-0.0.35-py39-none-manylinux) is actually built
+        #     against ROCm 7.1 with PYTORCH_ROCM_ARCH=None, so it ships
+        #     with *no* Composable-Kernel kernels — every CK op reports
+        #     "unavailable" and the dispatcher raises NotImplementedError
+        #     at the first memory_efficient_attention call.
+        #   - The older xformers-0.0.34-cp39-abi3 wheel at the same index
+        #     pins torch==2.10.0+rocm7.1, downgrading the entire stack
+        #     out from under torchvision/torchaudio. Even after that
+        #     downgrade the CK kernels segfault on gfx1030 and gfx1201
+        #     — the wheel only targets CDNA / data-center arches.
+        #   - A source build with PYTORCH_ROCM_ARCH="gfx1030;gfx1201"
+        #     does work but is a 30-60 min compile and out of scope here.
+        # SDPA on ROCm dispatches to the same underlying mem-efficient
+        # kernels xformers would, so the perf delta is negligible. If
+        # a real ROCm xformers (built for our arches and matching torch
+        # ABI) ever ships, delete this block.
+        _is_hip = getattr(torch.version, 'hip', None) is not None
+        if self.train_config.xformers and _is_hip:
+            print_acc("ROCm/HIP detected: substituting SDPA for xformers attention.")
+            self.train_config.xformers = False
+            self.train_config.sdp = True
+        # ----------------------------------------------------------------
+
         if self.train_config.xformers:
             vae.enable_xformers_memory_efficient_attention()
             unet.enable_xformers_memory_efficient_attention()
