@@ -36,7 +36,23 @@ if os.environ.get("ROCBLAS_LOG_LEVEL") is None:
 
 # set torch to trace mode
 import torch
-    
+
+# --- ROCm/HIP SDPA backend kludge -------------------------------------
+# AOTriton (the AOT-compiled flash/mem-efficient SDPA kernels bundled in
+# the torch ROCm wheel) only ships kernels for gfx90a/gfx942/gfx1100
+# (MI200/MI300X/Navi31). On this box's gfx1030 (RX 6900 XT) and gfx1201
+# (R9700) any SDPA call into the flash or mem-efficient backend raises
+# "[AOTriton] Accelerated SDPA only supports ...". Force the pure-ATen
+# math backend, which works on every arch (slightly more VRAM, but it's
+# the only functioning SDPA path here). Covers both the Mistral text
+# encoder and the Flux2 transformer. Delete if AOTriton ever ships
+# kernels for these arches.
+if getattr(torch.version, "hip", None) is not None:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+# ----------------------------------------------------------------------
+
 # check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
     torch.autograd.set_detect_anomaly(True)
