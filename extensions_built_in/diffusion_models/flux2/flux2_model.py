@@ -98,7 +98,15 @@ class Flux2Model(BaseModel):
         text_encoder: Mistral3ForConditionalGeneration = (
             Mistral3ForConditionalGeneration.from_pretrained(
                 MISTRAL_PATH,
-                torch_dtype=dtype,
+                # transformers >=5 deprecated/ignores `torch_dtype`, so Mistral
+                # was loading in fp32 (~96 GB host RAM for 24B) instead of
+                # bf16. Combined with quanto's one-shot whole-model qfloat8
+                # quantization that OOM-killed the box (dmesg: python anon-rss
+                # ~124-127 GB -> global OOM, ~30 s freeze). `dtype=` is the
+                # replacement kwarg; `low_cpu_mem_usage=True` streams shards in
+                # directly at the target dtype (~48 GB peak, no fp32 copy).
+                dtype=dtype,
+                low_cpu_mem_usage=True,
             )
         )
         if self.model_config.quantize_te:
@@ -153,6 +161,16 @@ class Flux2Model(BaseModel):
             transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
 
         transformer.load_state_dict(transformer_state_dict, assign=True)
+
+        # `assign=True` aliases the module params onto these dict tensors, so
+        # holding `transformer_state_dict` pins the FULL unquantized bf16
+        # transformer alive through quantize_model() AND load_te()'s Mistral
+        # load+quant -> host OOM at "Quantizing Mistral" (anon-rss ~120-128 GB).
+        # gc is not missing (flush() runs at :172/:116) -- this dangling ref is
+        # what makes it a no-op. Drop it so freeze() + the existing flush()
+        # actually reclaim the float weights before Mistral loads.
+        del transformer_state_dict
+        flush()
 
         if self.model_config.quantize:
             # patch the state dict method
