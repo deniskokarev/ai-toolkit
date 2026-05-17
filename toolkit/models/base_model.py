@@ -118,7 +118,7 @@ class BaseModel:
         self.vae_device_torch = torch.device(device)
         self.vae_torch_dtype = get_torch_dtype(model_config.vae_dtype)
 
-        self.te_device_torch = torch.device(device)
+        self.te_device_torch = torch.device(model_config.te_device) if model_config.te_device else torch.device(device)
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config

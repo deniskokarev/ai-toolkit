@@ -101,15 +101,14 @@ class Flux2Model(BaseModel):
                 torch_dtype=dtype,
             )
         )
-        text_encoder.to(self.device_torch, dtype=dtype)
-
-        flush()
-
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing Mistral")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
+            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
             freeze(text_encoder)
             flush()
+
+        text_encoder.to(self.te_device_torch, dtype=dtype)
+        flush()
 
         if (
             self.model_config.layer_offloading
@@ -117,7 +116,7 @@ class Flux2Model(BaseModel):
         ):
             MemoryManager.attach(
                 text_encoder,
-                self.device_torch,
+                self.te_device_torch,
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
 
@@ -249,7 +248,7 @@ class Flux2Model(BaseModel):
         if self.model_config.low_vram:
             text_encoder[0].to("cpu")
         else:
-            text_encoder[0].to(self.device_torch)
+            text_encoder[0].to(self.te_device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
         if self.model_config.low_vram:
@@ -464,13 +463,13 @@ class Flux2Model(BaseModel):
         return noise_pred
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
-        if self.pipeline.text_encoder.device != self.device_torch:
-            self.pipeline.text_encoder.to(self.device_torch)
+        if self.pipeline.text_encoder.device != self.te_device_torch:
+            self.pipeline.text_encoder.to(self.te_device_torch)
 
         prompt_embeds, prompt_embeds_mask = self.pipeline.encode_prompt(
-            prompt, device=self.device_torch
+            prompt, device=self.te_device_torch
         )
-        pe = PromptEmbeds(prompt_embeds)
+        pe = PromptEmbeds(prompt_embeds.to(self.device_torch))
         return pe
 
     def get_model_has_grad(self):
