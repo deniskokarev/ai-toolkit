@@ -242,13 +242,34 @@ export default function SimpleJob({
               required
             />
             {showGPUSelect && (
-              <SelectInput
-                label="GPU ID"
-                value={`${gpuIDs}`}
-                docKey="gpuids"
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
+              <div>
+                <label className="block text-xs mb-1 mt-2 text-gray-300">GPU ID</label>
+                <div className="flex flex-wrap gap-x-6 gap-y-2 mt-1">
+                  {gpuList.map((gpu: any) => {
+                    const idStr = `${gpu.index}`;
+                    const selected = `${gpuIDs ?? ''}`.split(',').filter(Boolean);
+                    return (
+                      <Checkbox
+                        key={gpu.index}
+                        label={`GPU #${gpu.index}`}
+                        checked={selected.includes(idStr)}
+                        onChange={checked => {
+                          let next = `${gpuIDs ?? ''}`.split(',').filter(Boolean);
+                          if (checked) {
+                            if (!next.includes(idStr)) next.push(idStr);
+                          } else {
+                            next = next.filter(x => x !== idStr);
+                          }
+                          // never allow an empty selection
+                          if (next.length === 0) next = [idStr];
+                          next.sort((a, b) => parseInt(a) - parseInt(b));
+                          setGpuIDs(next.join(','));
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
             )}
             {disableSections.includes('trigger_word') ? null : (
               <TextInput
