@@ -787,9 +787,14 @@ class StableDiffusion:
             flush()
             
             self.print_and_status_update("Loading T5")
-            tokenizer_2 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_2", torch_dtype=dtype)
+            tokenizer_2 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_2")
+            # transformers>=5 (this box: 5.5.3) ignores `torch_dtype` -> T5-XXL
+            # would load fp32 (~19 GB host) then get cast back: a needless 2x
+            # host-RAM spike + slower load. `dtype=` + low_cpu_mem_usage streams
+            # shards in at bf16 directly (~9.5 GB, no spike). torch_dtype on a
+            # tokenizer was always a no-op. Mirrors the flux2_model load_te fix.
             text_encoder_2 = T5EncoderModel.from_pretrained(base_model_path, subfolder="text_encoder_2",
-                                                            torch_dtype=dtype)
+                                                            dtype=dtype, low_cpu_mem_usage=True)
 
             text_encoder_2.to(self.device_torch, dtype=dtype)
             flush()
@@ -801,8 +806,8 @@ class StableDiffusion:
                 flush()
                 
             self.print_and_status_update("Loading CLIP")
-            text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
-            tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
+            text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder", dtype=dtype, low_cpu_mem_usage=True)
+            tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
             text_encoder.to(self.device_torch, dtype=dtype)
 
             self.print_and_status_update("Making pipe")
