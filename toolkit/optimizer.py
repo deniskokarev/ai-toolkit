@@ -61,6 +61,29 @@ def get_optimizer(
 
         optimizer = Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
     elif lower_type.endswith("8bit"):
+        # ROCm kludge (mirrors the xformers->SDPA HIP rewrite): bitsandbytes
+        # 8-bit optimizers have no working HIP kernels on gfx1201/gfx1030 ->
+        # AdamW8bit.step() takes ~20 s for a rank-32 LoRA (1/3 of the step).
+        # 8-bit optimizer state only matters for billion-param full fine-tunes;
+        # at LoRA param counts it's sub-GB either way, so transparently remap
+        # to the nearest NON-bnb optimizer. Per-type (NOT all->AdamW): wrong
+        # update rule / LR scale would silently corrupt training. Delete when
+        # bitsandbytes ships working ROCm 8-bit kernels.
+        if torch.version.hip is not None:
+            _rocm_bnb_fallback = {
+                "adam8bit": "adam",
+                "adamw8bit": "adamw",
+                "lion8bit": "lion",
+                "ademamix8bit": "adamw",  # no non-bnb AdEMAMix; adamw is closest
+            }.get(lower_type, "adamw")
+            print(
+                f"WARNING [ROCm]: bitsandbytes '{lower_type}' has no working "
+                f"HIP kernel (pathologically slow); using "
+                f"'{_rocm_bnb_fallback}' instead."
+            )
+            return get_optimizer(
+                params, _rocm_bnb_fallback, learning_rate, optimizer_params
+            )
         import bitsandbytes
 
         if lower_type == "adam8bit":
