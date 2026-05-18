@@ -728,6 +728,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
             self.modules_being_trained.append(self.sd.unet)
+            # accelerator.prepare() just moved the transformer CPU->GPU. Under
+            # low_vram its CPU home copy was ~30 GB of *pinned* (non-swappable)
+            # host RAM; nothing forces its release before the DataLoader forks
+            # workers at train start -> the parent's lingering pinned RSS is
+            # snapshotted into each worker -> host global OOM at step 0
+            # (qfloat8 run, 2026-05-17). Reclaim now, symmetric to the stage-0
+            # transformer_state_dict fix. Cheap when there's nothing to free.
+            flush()
         if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
                 self.sd.text_encoder = [self.accelerator.prepare(model) for model in self.sd.text_encoder]
@@ -1741,7 +1749,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
+        # --- ROCm/OOM durable fix: defer transformer -> GPU past TE caching ---
+        # The dataset text-embed caching pass (BaseSDTrainProcess.run ->
+        # get_dataloader_from_datasets, ~:2074) runs a Mistral-24B forward
+        # BEFORE hook_before_train_loop. On this ROCm/torchao build there is
+        # no fused quantized-linear kernel, so every Linear dequantizes its
+        # whole weight to bf16 + an int32 temp -- the text encoder alone needs
+        # its full footprint plus per-layer transients. If the transformer is
+        # co-resident this OOMs (single 32 GB card: 2x uintX ~= 30 GB; see
+        # progress.md "low_vram fix FAILED"). SDTrainer.hook_before_train_loop
+        # already parks the transformer on CPU for the sample-prompt-cache /
+        # TE-unload stage (SDTrainer.py ~:245) and set_device_state(
+        # train_device_state_preset) (~:2137) moves it back AFTER the TE is
+        # freed. So the only premature move is this one -- gate it so the
+        # transformer stays on CPU until the TE is gone. Single-card, full
+        # transformer quant quality, no offload slowdown. Delete this gate if
+        # a fused ROCm quantized-linear kernel ever ships (TE then fits
+        # co-resident and the staging is unnecessary).
+        if self.is_caching_text_embeddings:
+            unet.to('cpu', dtype=dtype)
+        else:
+            unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
         vae = vae.to(torch.device('cpu'), dtype=dtype)
