@@ -692,7 +692,11 @@ def get_dataloader_from_datasets(
         dataloader_kwargs['num_workers'] = 0
     else:
         dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers
-        dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
+        # PyTorch forbids prefetch_factor unless num_workers > 0 (it raises at
+        # DataLoader construction). num_workers: 0 is a valid/used config
+        # (e.g. avoiding worker-fork host-RAM blowups), so only pass it then.
+        if dataset_config_list[0].num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
 
     if has_buckets:
         # make sure they all have buckets
