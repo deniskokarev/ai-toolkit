@@ -18,6 +18,62 @@ from huggingface_hub import hf_hub_download
 from toolkit.print import print_acc
 import os
 
+# --- ROCm kludge: quanto 0.2.4 qint4/qint2 path crashes on HIP torch builds ---
+# optimum/quanto/tensor/qbits/qbits.py:128 gates a CUDA-only TinyGemm kernel
+# with `version.parse(torch.version.cuda).release >= (12, 1)`. On a ROCm torch
+# `torch.version.cuda` is None, so `version.parse(None)` raises TypeError
+# *before* the comparison can short-circuit to False -> every quanto sub-byte
+# type (qint4/qint2) is unusable here (qfloat8 dodges it: 8-bit = qbytes path).
+# Make that one call None-safe so the guard evaluates False on HIP and quanto
+# falls back to its portable QBitsTensor (TinyGemm/AWQ are CUDA-arch kernels
+# unusable on RDNA regardless). Delete when quanto makes the check None-safe
+# or torch.version.cuda is populated on ROCm.
+if getattr(torch.version, "cuda", None) is None:
+    # quanto 0.2.4 sub-byte (qint4/qint2) path is unusable on this ROCm torch
+    # on TWO counts, both in optimum/quanto/tensor/qbits/qbits.py:QBitsTensor.create:
+    #   1. :128 `version.parse(torch.version.cuda).release >= (12,1)` -> on HIP
+    #      torch.version.cuda is None -> TypeError before it can be False.
+    #   2. the `data.device.type == "cpu"` disjunct routes qint4 to
+    #      TinyGemmQBitsTensor, whose `aten::_convert_weight_to_int4pack` is
+    #      registered CUDA-only (fails for CPU tensors; the transformer is
+    #      quantized partly on CPU under low_vram).
+    # AWQ/TinyGemm are CUDA-arch kernels that don't even build here (hipcc
+    # rejects NVCC-only flags). Force quanto's portable QBitsTensor for every
+    # case, and keep a None-safe `version` proxy as insurance for any other
+    # call site. Delete when quanto supports ROCm sub-byte natively.
+    # NOTE: `optimum.quanto.tensor.qbits` is a *package* that also contains
+    # `tinygemm/qbits.py`, so `from ...qbits import qbits` is ambiguous and
+    # patches the wrong object under a large import graph -> import the exact
+    # submodule by full dotted path (import-order-independent).
+    import importlib as _importlib
+    from packaging import version as _pkg_version
+
+    class _NoneSafeVersion:
+        @staticmethod
+        def parse(v):
+            return _pkg_version.parse("0" if v is None else v)
+
+        def __getattr__(self, name):
+            return getattr(_pkg_version, name)
+
+    _qbits_mod = _importlib.import_module("optimum.quanto.tensor.qbits.qbits")
+    _qbits_mod.version = _NoneSafeVersion()
+
+    _QBitsTensor = _qbits_mod.QBitsTensor
+
+    def _portable_qbits_create(
+        qtype, axis, group_size, size, stride, data, scale, shift,
+        requires_grad=False,
+    ):
+        # exactly quanto's portable fall-through (qbits.py final return),
+        # bypassing the AWQ/TinyGemm branches entirely.
+        return _QBitsTensor(
+            qtype, axis, group_size, size, stride, data, scale, shift,
+            requires_grad,
+        )
+
+    _QBitsTensor.create = staticmethod(_portable_qbits_create)
+
 if TYPE_CHECKING:
     from toolkit.models.base_model import BaseModel
 
