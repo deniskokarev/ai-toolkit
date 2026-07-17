@@ -1,0 +1,78 @@
+---
+# Krea-2-Raw LoRA training on AMD GPUs under ROCm.
+#
+# Verified end-to-end on a single Radeon AI PRO R9700 (gfx1201 / RDNA4, 32 GB,
+# ROCm 7.2, torch 2.12 rocm build): uint4 transformer quantization (torchao),
+# qfloat8 text encoder (optimum-quanto), SDPA attention, and bitsandbytes
+# adamw8bit all work unmodified. ~12.4 s/it at 768px batch 1 with gradient
+# checkpointing; ~18 GB VRAM peak. Krea2's attention needs upstream commit
+# a92f18b (SDPA backend priority list instead of hardcoded cuDNN) — included
+# since 2026-07-15.
+#
+# The transformer is ~13B (26 GB bf16): uint4 -> ~6.5 GB resident. qfloat8
+# (~13 GB) should also fit a 32 GB card but is untested here; uint4 is the
+# verified setting.
+job: extension
+config:
+  name: "my_first_krea2_lora_rocm"
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      device: cuda:0
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: fp16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 768 ]
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "linear"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        ema_config:
+          use_ema: false
+        dtype: bf16
+        cache_text_embeddings: true
+        unload_text_encoder: false
+      model:
+        arch: "krea2"
+        name_or_path: "krea/Krea-2-Raw"
+        quantize: true
+        qtype: "uint4"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: false
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 768
+        height: 768
+        samples:
+          - prompt: "woman with red hair, playing chess at the park"
+          - prompt: "a woman holding a coffee cup, in a beanie, sitting at a cafe"
+          - prompt: "photo of a woman, white background, medium shot, modeling clothing, studio lighting, white backdrop"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'
