@@ -2,16 +2,22 @@
 # Krea-2-Raw LoRA training on AMD GPUs under ROCm.
 #
 # Verified end-to-end on a single Radeon AI PRO R9700 (gfx1201 / RDNA4, 32 GB,
-# ROCm 7.2, torch 2.12 rocm build): uint4 transformer quantization (torchao),
-# qfloat8 text encoder (optimum-quanto), SDPA attention, and bitsandbytes
-# adamw8bit all work unmodified. ~12.4 s/it at 768px batch 1 with gradient
-# checkpointing; ~18 GB VRAM peak. Krea2's attention needs upstream commit
-# a92f18b (SDPA backend priority list instead of hardcoded cuDNN) — included
-# since 2026-07-15.
+# ROCm 7.2, torch 2.12 rocm build): transformer quantization (torchao and
+# optimum-quanto), SDPA attention, and bitsandbytes adamw8bit all work
+# unmodified. Krea2's attention needs upstream commit a92f18b (SDPA backend
+# priority list instead of hardcoded cuDNN) — included since 2026-07-15.
 #
-# The transformer is ~13B (26 GB bf16): uint4 -> ~6.5 GB resident. qfloat8
-# (~13 GB) should also fit a 32 GB card but is untested here; uint4 is the
-# verified setting.
+# Measured on the 25-image smoke set, 20 steps each, 768px batch 1 with
+# gradient checkpointing (transformer ~13B / 26 GB bf16):
+#   qtype     library   s/it   VRAM peak
+#   uint4     torchao   13.1   18 GiB   <- fits ~16 GB cards
+#   qfloat8   quanto    12.1   26 GiB   <- this config (with TE unload)
+#   int8      torchao   11.7   ~25 GiB
+#   qint8     quanto    12.1   ~25 GiB
+#   bf16 (no quant)     OOM on one 32 GB card
+# Spread is ~12%: the step is matmul-bound, so pick qtype by quality/VRAM,
+# not speed. unload_text_encoder frees the TE (~2 GiB) after embedding
+# caching; without it qfloat8 peaks at 28 GiB, which still fits.
 job: extension
 config:
   name: "my_first_krea2_lora_rocm"
@@ -50,12 +56,12 @@ config:
           use_ema: false
         dtype: bf16
         cache_text_embeddings: true
-        unload_text_encoder: false
+        unload_text_encoder: true
       model:
         arch: "krea2"
         name_or_path: "krea/Krea-2-Raw"
         quantize: true
-        qtype: "uint4"
+        qtype: "qfloat8"
         quantize_te: true
         qtype_te: "qfloat8"
         low_vram: false
