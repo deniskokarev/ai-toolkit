@@ -280,7 +280,12 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         .sort()
         .filter(key => key !== 'Idle')
         .map(gpuKey => {
-          const queue = queues.find(q => `${q.gpu_ids}` === gpuKey) as Queue;
+          // multi-GPU jobs are grouped under their first GPU index, but run
+          // on a queue keyed by the full gpu_ids string (e.g. "0,1") — look
+          // up the queue via the active job, falling back to the GPU index
+          const activeJob = jobsDict[gpuKey].jobs.find(j => ['running', 'stopping', 'queued'].includes(j.status));
+          const queue = (queues.find(q => `${q.gpu_ids}` === `${activeJob?.gpu_ids}`) ??
+            queues.find(q => `${q.gpu_ids}` === gpuKey)) as Queue;
           return (
             <div key={gpuKey} className="mb-6">
               <div
@@ -315,7 +320,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
                       <span className="text-red-100 dark:text-red-400 mr-2">Queue Stopped</span>
                       <button
                         onClick={async () => {
-                          await startQueue(gpuKey);
+                          await startQueue((queue?.gpu_ids as string) ?? gpuKey);
                           refresh();
                         }}
                         className="ml-2 sm:ml-4 text-xs text-white bg-green-600 hover:bg-green-700 px-2 py-1 rounded"
