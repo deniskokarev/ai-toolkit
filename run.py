@@ -80,8 +80,10 @@ def _maybe_relaunch_ddp():
         indices = [d.split(":", 1)[1] if ":" in d else d for d in devices]
         env["HIP_VISIBLE_DEVICES"] = ",".join(indices)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+    # invoke accelerate through our own interpreter: the UI launches this
+    # script with an absolute python path, so venv/bin may not be on PATH
     cmd = [
-        "accelerate", "launch",
+        sys.executable, "-m", "accelerate.commands.launch",
         "--num_processes", str(len(devices)),
         "--num_machines", "1",
         "--mixed_precision", "no",
