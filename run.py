@@ -10,6 +10,10 @@ seed = None
 if "SEED" in os.environ:
     try:
         seed = int(os.environ["SEED"])
+        # under distributed data-parallel training each rank must shuffle its
+        # batches differently, or the replicas compute identical gradients and
+        # the extra GPUs do duplicated work
+        seed += int(os.environ.get("RANK", 0))
     except ValueError:
         print(f"Invalid SEED value: {os.environ['SEED']}. SEED must be an integer.")
 
@@ -19,6 +23,80 @@ sys.path.insert(0, os.getcwd())
 
 # turn off diffusers telemetry until I can figure out how to make it opt-in
 os.environ['DISABLE_TELEMETRY'] = 'YES'
+
+
+def _maybe_relaunch_ddp():
+    """Multi-GPU data-parallel self-launch.
+
+    If a config lists ``ddp_devices`` (process level, e.g.
+    ``ddp_devices: ["cuda:0", "cuda:1"]``) and we are not already inside a
+    distributed launch, re-exec through ``accelerate launch`` with one
+    process per listed device. Each process trains a full model replica on
+    its own GPU with per-rank batches; gradients are all-reduced by
+    accelerate/DDP. Runs before any torch import so the relaunch is instant.
+    """
+    if os.environ.get("LOCAL_RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
+        return  # already inside a distributed launch
+    import yaml
+    devices = None
+    skip_next = False
+    for arg in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("-n", "--name", "-l", "--log"):
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        path = arg
+        if not os.path.exists(path):
+            for ext in (".yaml", ".yml", ".json"):
+                candidate = os.path.join("config", arg + ext)
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                cfg = yaml.safe_load(f)
+        except Exception:
+            continue
+        for proc in ((cfg or {}).get("config", {}) or {}).get("process", []) or []:
+            dd = proc.get("ddp_devices") if isinstance(proc, dict) else None
+            if dd and len(dd) > 1:
+                devices = [str(d) for d in dd]
+                break
+        if devices:
+            break
+    if not devices:
+        return
+    env = dict(os.environ)
+    if not any(k in env for k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")):
+        # map the listed devices to the visible set; ranks then bind to
+        # cuda:LOCAL_RANK within it. If the user already restricted
+        # visibility, respect their mapping and just launch N processes.
+        indices = [d.split(":", 1)[1] if ":" in d else d for d in devices]
+        env["HIP_VISIBLE_DEVICES"] = ",".join(indices)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+    cmd = [
+        "accelerate", "launch",
+        "--num_processes", str(len(devices)),
+        "--num_machines", "1",
+        "--mixed_precision", "no",
+        "--dynamo_backend", "no",
+        os.path.abspath(__file__),
+    ] + sys.argv[1:]
+    print(
+        f"ddp_devices {devices}: relaunching via accelerate launch "
+        f"--num_processes {len(devices)}",
+        flush=True,
+    )
+    os.execvpe(cmd[0], cmd, env)
+
+
+_maybe_relaunch_ddp()
 
 # set torch to trace mode
 import torch
