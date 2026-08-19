@@ -433,7 +433,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             elif self.is_video:
                 # only look for videos
                 extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.')]
+            file_list = []
+            for root, dirs, files in os.walk(self.dataset_path):
+                # don't descend into hidden folders. the UI writes its
+                # thumbnails to a .thumbs dir inside the dataset, and those
+                # are named after the image they preview ("003.png.jpg"), so
+                # the dotfile check below never sees them and they end up
+                # enrolled as training images.
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                file_list.extend(
+                    os.path.join(root, file) for file in files
+                    if file.lower().endswith(tuple(extensions)) and not file.startswith('.')
+                )
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
