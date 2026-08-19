@@ -849,8 +849,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
+        # every rank has to read this, not just rank 0. the resume step sets
+        # the bounds of the training loop, so if only the main process picks
+        # it up the ranks run different loops: rank 0 goes
+        # range(resume_step, steps) while the others go range(0, steps). they
+        # stay in lockstep for rank 0's share, then rank 0 exits and the rest
+        # block forever in an all-reduce with no peer -- which on ROCm is a
+        # spin-wait kernel, so the GPU sits at 100% and full power until the
+        # collective timeout (6h, see toolkit/accelerator.py) fires.
+        # reading the file per rank rather than broadcasting keeps this free
+        # of collectives, so a rank-divergent caller can't deadlock here.
         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
             # dont load metadata from pretrained lora
             return
