@@ -865,8 +865,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
+        # every rank has to read this, not just rank 0. the resume step sets
+        # the bounds of the training loop, so if only the main process picks
+        # it up the ranks run different loops: rank 0 goes
+        # range(resume_step, steps) while the others go range(0, steps). they
+        # stay in lockstep for rank 0's share, then rank 0 exits and the rest
+        # block forever in an all-reduce with no peer -- which on ROCm is a
+        # spin-wait kernel, so the GPU sits at 100% and full power until the
+        # collective timeout (6h, see toolkit/accelerator.py) fires.
+        # reading the file per rank rather than broadcasting keeps this free
+        # of collectives, so a rank-divergent caller can't deadlock here.
         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
             # dont load metadata from pretrained lora
             return
@@ -2619,15 +2627,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             did_oom = False
+            oom_detail = ''
             loss_dict = None
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as e:
                 did_oom = True
+                oom_detail = str(e)
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     did_oom = True
+                    oom_detail = str(e)
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
@@ -2642,6 +2653,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("################################################")
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
                 print_acc("################################################")
+                # first line of the torch message carries device / size / free
+                print_acc(f"# {oom_detail.splitlines()[0][:200] if oom_detail else '(no detail)'}")
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0

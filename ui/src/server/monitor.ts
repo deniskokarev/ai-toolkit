@@ -4,6 +4,7 @@ import os from 'os';
 import si from 'systeminformation';
 import { loadMacstats } from '@/server/macstats';
 import { createLoadSampler, readCpuTemperature, readMemory } from '@/server/cpuStats';
+import { getRocmGpuStats } from '@/server/rocmStats';
 import { CpuInfo, GpuInfo, GPUApiResponse, MonitorHistoryPoint, MonitorInit, MonitorSample } from '@/types';
 import { historyPointFromSample, MONITOR_HISTORY_LENGTH, MONITOR_TICK_MS } from '@/utils/monitorSample';
 
@@ -19,6 +20,10 @@ const execFileAsync = promisify(execFile);
  * spawn-per-request /api/gpu route slow. If loop mode never produces output
  * (or nvidia-smi keeps hanging), we fall back to a one-shot spawn per tick,
  * which matches the old route's behavior exactly.
+ *
+ * On AMD, nvidia-smi is absent and we sample rocm-smi instead. It has no loop
+ * mode, so that path is a spawn per sample and is deliberately slower than the
+ * tick (see ROCM_REFRESH_MS).
  */
 
 const NV_QUERY_ARGS = [
@@ -34,6 +39,11 @@ const NV_WATCHDOG_MS = 15_000;
 const NV_BATCH_FLUSH_MS = 100;
 // Temperature refresh is decoupled from the tick (see refreshCpuTemp)
 const CPU_TEMP_REFRESH_MS = 5000;
+// rocm-smi is a Python script with no loop mode: one sample costs a process
+// spawn at ~150-350 ms of a full core. At the 500 ms tick that would burn a
+// third of a core forever, so the AMD path refreshes on its own slower clock
+// and every tick in between re-publishes the last reading.
+const ROCM_REFRESH_MS = 2000;
 
 function parseGpuLine(line: string): GpuInfo | null {
   const [
@@ -101,6 +111,9 @@ class SystemMonitor {
   private nvOneShotMode = false;
   private nvOneShotInFlight = false;
   private lastNvLineAt = 0;
+  private rocmMode = false;
+  private rocmInFlight = false;
+  private lastRocmAt = 0;
   private tickInFlight = false;
   private lastCpuTemp = 0;
   private cpuTempInFlight = false;
@@ -166,6 +179,8 @@ class SystemMonitor {
     try {
       if (this.isMac) {
         this.latestGpu = this.sampleMacGpu();
+      } else if (this.rocmMode) {
+        await this.sampleRocm();
       } else if (this.nvOneShotMode) {
         await this.sampleNvOneShot();
       } else {
@@ -266,9 +281,13 @@ class SystemMonitor {
   // Mac GPU (mirrors /api/gpu's mac path)
   // -------------------------------------------------------------------------
   private initMacGpuName(): void {
-    execFileAsync('sh', ['-c', 'system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Total Number of Cores"'], {
-      timeout: 5000,
-    })
+    execFileAsync(
+      'sh',
+      ['-c', 'system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Total Number of Cores"'],
+      {
+        timeout: 5000,
+      },
+    )
       .then(({ stdout }) => {
         const nameMatch = stdout.match(/Chipset Model:\s*(.+)/);
         const coresMatch = stdout.match(/Total Number of Cores:\s*(\d+)/);
@@ -476,6 +495,53 @@ class SystemMonitor {
       gpus: [],
       error: 'nvidia-smi not found or not accessible',
     };
+    // No NVIDIA tooling: this may still be an AMD box. Try rocm-smi, and only
+    // if that fails too does the "no supported GPUs" banner stand.
+    if (process.platform !== 'win32') {
+      this.rocmMode = true; // ROCm SMI is Linux-only
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // AMD / rocm-smi (mirrors /api/gpu's rocm path via the shared parser)
+  // -------------------------------------------------------------------------
+  private async sampleRocm(): Promise<void> {
+    if (this.rocmInFlight) return;
+    if (Date.now() - this.lastRocmAt < ROCM_REFRESH_MS) return;
+    this.rocmInFlight = true;
+    try {
+      const gpus = await getRocmGpuStats();
+      this.lastRocmAt = Date.now();
+      if (gpus.length === 0) {
+        // rocm-smi ran but reported nothing usable — say so rather than
+        // claiming the tool is missing.
+        this.latestGpu = { hasNvidiaSmi: false, hasRocmSmi: true, isMac: false, gpus: [] };
+        return;
+      }
+      this.latestGpu = {
+        hasNvidiaSmi: false,
+        hasRocmSmi: true,
+        isMac: false,
+        gpus: gpus.sort((a, b) => a.index - b.index),
+      };
+    } catch (err) {
+      this.lastRocmAt = Date.now();
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // Neither vendor tool exists; stop spawning and raise the banner.
+        this.rocmMode = false;
+        this.latestGpu = {
+          hasNvidiaSmi: false,
+          hasRocmSmi: false,
+          isMac: false,
+          gpus: [],
+          error: 'Neither nvidia-smi nor rocm-smi found or accessible',
+        };
+      } else {
+        console.error('Monitor: rocm-smi sample failed:', err);
+      }
+    } finally {
+      this.rocmInFlight = false;
+    }
   }
 }
 

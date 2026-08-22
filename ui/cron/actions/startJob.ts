@@ -218,6 +218,15 @@ const startAndWatchJob = (job: Job) => {
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
 
+    // multiple GPUs selected -> data-parallel launch. run.py relaunches
+    // itself through `accelerate launch` when the config lists ddp_devices.
+    // CUDA_VISIBLE_DEVICES (set below from gpu_ids) remaps the selected
+    // cards, so the ranks always see them as cuda:0..N-1.
+    const gpuIdList = `${job.gpu_ids}`.split(',').filter(x => x.trim() !== '');
+    if (gpuIdList.length > 1) {
+      jobConfig.config.process[0].ddp_devices = gpuIdList.map((_, i) => `cuda:${i}`);
+    }
+
     // write the config file
     fs.writeFileSync(configPath, JSON.stringify(jobConfig, null, 2));
 

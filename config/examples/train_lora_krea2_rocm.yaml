@@ -1,0 +1,84 @@
+---
+# Krea-2-Raw LoRA training on AMD GPUs under ROCm.
+#
+# Verified end-to-end on a single Radeon AI PRO R9700 (gfx1201 / RDNA4, 32 GB,
+# ROCm 7.2, torch 2.12 rocm build): transformer quantization (torchao and
+# optimum-quanto), SDPA attention, and bitsandbytes adamw8bit all work
+# unmodified. Krea2's attention needs upstream commit a92f18b (SDPA backend
+# priority list instead of hardcoded cuDNN) — included since 2026-07-15.
+#
+# Measured on the 25-image smoke set, 20 steps each, 768px batch 1 with
+# gradient checkpointing (transformer ~13B / 26 GB bf16):
+#   qtype     library   s/it   VRAM peak
+#   uint4     torchao   13.1   18 GiB   <- fits ~16 GB cards
+#   qfloat8   quanto    12.1   26 GiB   <- this config (with TE unload)
+#   int8      torchao   11.7   ~25 GiB
+#   qint8     quanto    12.1   ~25 GiB
+#   bf16 (no quant)     OOM on one 32 GB card
+# Spread is ~12%: the step is matmul-bound, so pick qtype by quality/VRAM,
+# not speed. unload_text_encoder frees the TE (~2 GiB) after embedding
+# caching; without it qfloat8 peaks at 28 GiB, which still fits.
+job: extension
+config:
+  name: "my_first_krea2_lora_rocm"
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      device: cuda:0
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: fp16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 768 ]
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "linear"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        ema_config:
+          use_ema: false
+        dtype: bf16
+        cache_text_embeddings: true
+        unload_text_encoder: true
+      model:
+        arch: "krea2"
+        name_or_path: "krea/Krea-2-Raw"
+        quantize: true
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: false
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 768
+        height: 768
+        samples:
+          - prompt: "woman with red hair, playing chess at the park"
+          - prompt: "a woman holding a coffee cup, in a beanie, sitting at a cafe"
+          - prompt: "photo of a woman, white background, medium shot, modeling clothing, studio lighting, white backdrop"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'
