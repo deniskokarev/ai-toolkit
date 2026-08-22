@@ -110,7 +110,12 @@ _maybe_relaunch_ddp()
 
 # set torch to trace mode
 import torch
-    
+
+# MIOpen picks pathological conv algorithms on RDNA3/RDNA4 (36x on a 1536px
+# VAE encode) -- must happen before any model is built. See toolkit/rocm.py.
+from toolkit.rocm import configure_rocm_backends
+configure_rocm_backends()
+
 # check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
     torch.autograd.set_detect_anomaly(True)
