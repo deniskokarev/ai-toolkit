@@ -1689,6 +1689,7 @@ export const quantizationOptions: SelectOption[] = [
   { value: '', label: '- NONE -' },
   { value: 'qfloat8', label: 'qfloat8 (default)' },
   { value: 'float8', label: 'float8' },
+  { value: 'int8', label: 'int8' },
   { value: 'convrot8', label: '8bit convrot' },
   { value: 'convrot4', label: '4bit convrot (nvfp4)' },
   { value: 'nvfp4', label: 'nvfp4 (4bit weight only)' },
