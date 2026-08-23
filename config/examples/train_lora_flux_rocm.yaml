@@ -1,0 +1,74 @@
+---
+# FLUX.1-dev LoRA training on AMD GPUs under ROCm.
+#
+# Verified end-to-end on a Radeon AI PRO R9700 (gfx1201 / RDNA4, 32 GB,
+# ROCm 7.2, torch 2.12 rocm build): quantization (qfloat8 via optimum-quanto),
+# SDPA flash attention (AOTriton), and the bitsandbytes adamw8bit optimizer
+# all work unmodified. ~4.2 s/it at 768px batch 1 with gradient checkpointing.
+#
+# Notes for ROCm users:
+#  - install the ROCm torch build first (e.g. from https://rocm.nightlies.amd.com
+#    or the stable rocm index), then `pip install -r requirements.txt`
+#  - AMD GPUs enumerate as cuda:N under ROCm/HIP; no config changes needed
+#  - RDNA4 (gfx12xx) runs flash SDPA; older archs may need the math backend
+job: extension
+config:
+  name: "my_first_flux_lora_rocm"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+        dtype: bf16
+      model:
+        name_or_path: "black-forest-labs/FLUX.1-dev"
+        is_flux: true
+        quantize: true
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "woman with red hair, playing chess at the park, bomb going off in the background"
+          - "a woman holding a coffee cup, in a beanie, sitting at a cafe"
+          - "a man showing off his cool new t shirt at the beach, a shark is jumping out of the water in the background"
+          - "photo of a man, white background, medium shot, modeling clothing, studio lighting, white backdrop"
+          - "a man holding a sign that says, 'this is a sign'"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 20
+meta:
+  name: "[name]"
+  version: '1.0'

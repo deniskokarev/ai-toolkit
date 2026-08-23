@@ -1,0 +1,88 @@
+---
+# Krea-2-Raw LoRA on TWO GPUs with data parallelism -- the 2-GPU throughput
+# configuration. `ddp_devices` makes `python run.py <config>` relaunch itself
+# through `accelerate launch` with one process per listed device: each rank
+# trains a full int8 replica on its own card and DDP all-reduces the (tiny)
+# LoRA gradients each step. No weights are ever merged -- replicas start
+# identical (rank-0 broadcast) and stay identical because every rank applies
+# the same averaged gradients.
+#
+# Measured on 2x Radeon AI PRO R9700 (gfx1201, ROCm 7.2, torch 2.12),
+# 768px, rank-16 LoRA, gradient checkpointing, 20-step runs:
+#   1 GPU  int8 batch 1:              11.7 s/sample
+#   2 GPU  int8 batch 1/rank (this):   5.9 s/sample  (1.97x -- allreduce ~1%)
+# Controls: per-card batch 2 gained only ~5% (matmul-bound) and OOMs at
+# int8/768px anyway; uint4 is 12% slower than int8 at equal batch. So:
+# batch 1 per rank, int8, one rank per card is the sweet spot.
+#
+# Per-rank VRAM = single-GPU VRAM at that batch + ~1 GB (RCCL buffers,
+# allreduce bucket): ~26 GiB/card here.
+#
+# Batching note: each rank shuffles independently (both cover the whole
+# dataset in different order -- statistically sound for LoRA training).
+# If you set the SEED env var, run.py offsets it by rank so the replicas
+# do not mirror each other's batches.
+job: extension
+config:
+  name: "krea2_ddp_lora"
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      device: cuda
+      ddp_devices: ["cuda:0", "cuda:1"]
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: fp16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [ 768 ]
+      train:
+        batch_size: 1   # per rank; effective batch = ranks x this
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "linear"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        ema_config:
+          use_ema: false
+        dtype: bf16
+        cache_text_embeddings: true
+        unload_text_encoder: true
+      model:
+        arch: "krea2"
+        name_or_path: "krea/Krea-2-Raw"
+        quantize: true
+        qtype: "int8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: false
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 768
+        height: 768
+        samples:
+          - prompt: "woman with red hair, playing chess at the park"
+          - prompt: "photo of a woman, white background, medium shot, modeling clothing, studio lighting, white backdrop"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'
