@@ -16,6 +16,7 @@ from PIL import Image, ImageOps
 from torchvision import transforms
 from diffusers import T2IAdapter, ControlNetModel
 from diffusers.training_utils import compute_density_for_timestep_sampling
+from safetensors import safe_open
 from safetensors.torch import save_file, load_file
 # from lycoris.config import PRESET
 from torch.utils.data import DataLoader
@@ -820,6 +821,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_after_sd_init_before_load(self):
         pass
 
+    @staticmethod
+    def get_saved_step(path):
+        """The training step a checkpoint records for itself, or None.
+
+        Only safetensors carry this; anything else (a diffusers directory, a
+        .pt file) has no cheap way to report one and gets None.
+        """
+        if not path.endswith('.safetensors') or not os.path.isfile(path):
+            return None
+        try:
+            with safe_open(path, framework='pt') as f:
+                metadata = f.metadata() or {}
+            training_info = metadata.get('training_info')
+            if training_info is None:
+                return None
+            return int(json.loads(training_info)['step'])
+        except Exception:
+            # unreadable or unexpected shape -- fall back to ctime ordering
+            return None
+
     def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
         if name == None:
             name = self.job.name
@@ -851,7 +872,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_cn' not in p]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
+                    # Order by the step each checkpoint reports for itself,
+                    # and fall back to ctime for anything that does not
+                    # report one (directories, .pt files, older saves).
+                    #
+                    # ctime alone is only a proxy for "newest": it holds
+                    # while a run writes its own checkpoints in step order,
+                    # and breaks the moment a run is copied in from another
+                    # machine, because cp stamps ctime in copy order. That
+                    # made an imported run resume from whichever checkpoint
+                    # the copy happened to touch last -- silently, since
+                    # every file is individually valid.
+                    saved_steps = {p: self.get_saved_step(p) for p in paths}
+                    latest_path = max(
+                        paths,
+                        key=lambda p: (
+                            saved_steps[p] is not None,
+                            saved_steps[p] or 0,
+                            os.path.getctime(p),
+                        ),
+                    )
         
         if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
