@@ -505,9 +505,13 @@ class SingleStreamDiT(nn.Module):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
 
-        # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
+        # Pad combined sequence to a multiple of 256 to stabilize compiled
+        # kernel shapes. Only under torch.compile: in eager mode the padding
+        # forces a key-padding mask, and a non-None attn_mask pushes SDPA off
+        # the flash kernels (math fallback on ROCm materializes B*H*L*L;
+        # measured ~4x slower end-to-end than flash at these lengths).
         fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
+        _padlen = (-fulllen) % 256 if torch.compiler.is_compiling() else 0
         if _padlen > 0:
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
@@ -531,7 +535,12 @@ class SingleStreamDiT(nn.Module):
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        mask = _mask(mask)
+        # An all-True key-padding mask guards nothing (batch 1 / equal text
+        # lengths / no alignment padding): drop it so SDPA can pick flash.
+        if bool(mask.all()):
+            mask = None
+        else:
+            mask = _mask(mask)
 
         if reflen > 0 and isolate_refs:
             # Asymmetric attention (OminiControl2-style "feature reuse"): ref
@@ -546,6 +555,8 @@ class SingleStreamDiT(nn.Module):
                 combined.shape[1], dtype=torch.bool, device=combined.device
             )
             is_ref[split : split + reflen] = True
+            if mask is None:
+                mask = _mask(padmask)
             mask = mask & (~is_ref[:, None] | is_ref[None, :])
 
         # Ref K/V caching (inference-only; requires isolate_refs so the cached
@@ -565,6 +576,8 @@ class SingleStreamDiT(nn.Module):
             # live queries may attend a cached ref key wherever that ref token
             # is real (refmask right-pads samples with fewer ref tokens)
             extra = padmask.unsqueeze(1).unsqueeze(3) & refmask.unsqueeze(1).unsqueeze(2)
+            if mask is None:
+                mask = _mask(padmask)
             mask = torch.cat((mask, extra), dim=3)
 
         freqs = self.posemb(pos)

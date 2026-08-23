@@ -2619,15 +2619,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             did_oom = False
+            oom_detail = ''
             loss_dict = None
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as e:
                 did_oom = True
+                oom_detail = str(e)
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     did_oom = True
+                    oom_detail = str(e)
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
@@ -2642,6 +2645,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("################################################")
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
                 print_acc("################################################")
+                # first line of the torch message carries device / size / free
+                print_acc(f"# {oom_detail.splitlines()[0][:200] if oom_detail else '(no detail)'}")
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
