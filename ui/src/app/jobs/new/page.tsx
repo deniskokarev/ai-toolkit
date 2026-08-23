@@ -7,7 +7,7 @@ import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
 import { useNestedState, setNestedValue } from '@/utils/hooks';
-import { SelectInput } from '@/components/formInputs';
+import { SelectInput, Checkbox } from '@/components/formInputs';
 import useSettings from '@/hooks/useSettings';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import useDatasetList from '@/hooks/useDatasetList';
@@ -204,11 +204,31 @@ export default function TrainingForm() {
         {showAdvancedView && (
           <>
             <div className="hidden sm:block">
-              <SelectInput
-                value={`${gpuIDs}`}
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
+              <div className="flex flex-wrap gap-x-4 gap-y-1 items-center">
+                {gpuList.map((gpu: any) => {
+                  const idStr = `${gpu.index}`;
+                  const selected = `${gpuIDs ?? ''}`.split(',').filter(Boolean);
+                  return (
+                    <Checkbox
+                      key={gpu.index}
+                      label={`GPU #${gpu.index}`}
+                      checked={selected.includes(idStr)}
+                      onChange={checked => {
+                        let next = `${gpuIDs ?? ''}`.split(',').filter(Boolean);
+                        if (checked) {
+                          if (!next.includes(idStr)) next.push(idStr);
+                        } else {
+                          next = next.filter(x => x !== idStr);
+                        }
+                        // never allow an empty selection
+                        if (next.length === 0) next = [idStr];
+                        next.sort((a, b) => parseInt(a) - parseInt(b));
+                        setGpuIDs(next.join(','));
+                      }}
+                    />
+                  );
+                })}
+              </div>
             </div>
             <div className="hidden sm:block mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
             <div className="hidden md:block">

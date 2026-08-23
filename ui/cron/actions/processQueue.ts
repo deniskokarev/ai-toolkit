@@ -3,6 +3,15 @@ import prisma from '../prisma';
 import { Job, Queue } from '@prisma/client';
 import startJob from './startJob';
 
+const isPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export default async function processQueue() {
   const queues: Queue[] = await prisma.queue.findMany({
     orderBy: {
@@ -41,7 +50,15 @@ export default async function processQueue() {
       });
 
       if (runningJob) {
-        // already running, nothing to do
+        // a crashed process otherwise leaves the job stuck in 'running'
+        // ("Starting job...") and blocks the queue forever
+        if (runningJob.status === 'running' && runningJob.pid != null && !isPidAlive(runningJob.pid)) {
+          console.log(`Job ${runningJob.id} (pid ${runningJob.pid}) died unexpectedly, marking as error`);
+          await prisma.job.update({
+            where: { id: runningJob.id },
+            data: { status: 'error', info: 'Process died unexpectedly' },
+          });
+        }
         continue; // skip to next queue
       } else {
         // find the next job in the queue
