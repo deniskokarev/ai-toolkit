@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import os from 'os';
 import { cached } from '@/server/apiCache';
 import { loadMacstats } from '@/server/macstats';
+import { checkRocmSmi, getRocmGpuStats } from '@/server/rocmStats';
 
 const execAsync = promisify(exec);
 
@@ -134,21 +135,32 @@ async function getGpuInfo() {
   // Check if nvidia-smi is available
   const hasNvidiaSmi = await checkNvidiaSmi(isWindows);
 
-  if (!hasNvidiaSmi) {
+  if (hasNvidiaSmi) {
+    const gpuStats = await getGpuStats(isWindows);
     return {
-      hasNvidiaSmi: false,
-      isMac: false,
-      gpus: [],
-      error: 'nvidia-smi not found or not accessible',
+      hasNvidiaSmi: true,
+      gpus: gpuStats,
     };
   }
 
-  // Get GPU stats
-  const gpuStats = await getGpuStats(isWindows);
+  // AMD ROCm fallback
+  const hasRocmSmi = await checkRocmSmi(isWindows);
+  if (hasRocmSmi) {
+    const gpuStats = await getRocmGpuStats();
+    return {
+      hasNvidiaSmi: false,
+      hasRocmSmi: true,
+      isMac: false,
+      gpus: gpuStats,
+    };
+  }
 
   return {
-    hasNvidiaSmi: true,
-    gpus: gpuStats,
+    hasNvidiaSmi: false,
+    hasRocmSmi: false,
+    isMac: false,
+    gpus: [],
+    error: 'Neither nvidia-smi nor rocm-smi found or accessible',
   };
 }
 
