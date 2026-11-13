@@ -62,6 +62,28 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
+    if mask is not None and mask.dim() == 2:
+        # (B, L) key-padding mask (True = real token). Any attn_mask pushes
+        # SDPA off the flash kernels (on ROCm: onto the math backend, which
+        # materializes B*H*L*L per layer -- batch 2 at 768px cost more VRAM
+        # than batch 1 at 1280px). Instead run each sample on its real tokens
+        # only, unmasked, and leave padded positions zero. Exact for real
+        # tokens: padded keys are dropped instead of masked; padded query rows
+        # are never read (text pad is never a key and is sliced off the output).
+        if bool(mask.all()):
+            return attention(q, k, v, None, scale, gqa)
+        out = q.new_zeros(q.shape[0], q.shape[2], q.shape[1] * q.shape[3])
+        for i in range(q.shape[0]):
+            idx = mask[i].nonzero().squeeze(1)
+            out[i, idx] = attention(
+                q[i : i + 1, :, idx],
+                k[i : i + 1, :, idx],
+                v[i : i + 1, :, idx],
+                None,
+                scale,
+                gqa,
+            )[0]
+        return out
     # cuDNN attention is NVIDIA-only, so hardcoding SDPBackend.CUDNN_ATTENTION
     # raises "No available kernel" on non-NVIDIA backends (AMD ROCm, Intel XPU,
     # Apple MPS). Pass a priority list instead: cuDNN is still preferred on
@@ -516,7 +538,8 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
-        txtmask = _mask(mask[:, : context.shape[1]])
+        # (B, Ltxt) key-padding mask; attention() handles 2-D masks per sample
+        txtmask = mask[:, : context.shape[1]]
 
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
@@ -556,10 +579,11 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
         # An all-True key-padding mask guards nothing (batch 1 / equal text
         # lengths / no alignment padding): drop it so SDPA can pick flash.
+        # Otherwise keep it 2-D: attention() then runs each sample unmasked on
+        # its real tokens (flash) instead of a 4-D mask forcing math attention.
+        # The ref paths below need a real 4-D mask and expand it themselves.
         if bool(mask.all()):
             mask = None
-        else:
-            mask = _mask(mask)
 
         if reflen > 0 and isolate_refs:
             # Asymmetric attention (OminiControl2-style "feature reuse"): ref
@@ -574,7 +598,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
                 combined.shape[1], dtype=torch.bool, device=combined.device
             )
             is_ref[split : split + reflen] = True
-            if mask is None:
+            if mask is None or mask.dim() == 2:
                 mask = _mask(padmask)
             mask = mask & (~is_ref[:, None] | is_ref[None, :])
 
@@ -595,7 +619,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             # live queries may attend a cached ref key wherever that ref token
             # is real (refmask right-pads samples with fewer ref tokens)
             extra = padmask.unsqueeze(1).unsqueeze(3) & refmask.unsqueeze(1).unsqueeze(2)
-            if mask is None:
+            if mask is None or mask.dim() == 2:
                 mask = _mask(padmask)
             mask = torch.cat((mask, extra), dim=3)
 
