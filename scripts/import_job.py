@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
 
 import yaml
@@ -56,13 +57,31 @@ def print_diff(old, new):
         print(f"  {k}: {json.dumps(a.get(k, '<unset>'))} -> {json.dumps(b.get(k, '<unset>'))}")
 
 
+def saved_step(path):
+    """training_info.step from a safetensors header (no tensor data read), or None."""
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            meta = json.loads(f.read(n)).get("__metadata__") or {}
+        return int(json.loads(meta["training_info"])["step"])
+    except (OSError, ValueError, KeyError, TypeError, struct.error):
+        return None
+
+
 def latest_checkpoint_step(folder, name):
+    # The same candidates the trainer resumes from: every <name>*.safetensors,
+    # including the final un-numbered save, ranked by the step each records.
     steps = []
     try:
         for f in os.listdir(folder):
-            m = re.fullmatch(rf"{re.escape(name)}_(\d+)\.safetensors", f)
-            if m:
-                steps.append(int(m.group(1)))
+            if not (f.startswith(name) and f.endswith(".safetensors")):
+                continue
+            step = saved_step(os.path.join(folder, f))
+            if step is None:
+                m = re.fullmatch(rf"{re.escape(name)}_(\d+)\.safetensors", f)
+                step = int(m.group(1)) if m else None
+            if step is not None:
+                steps.append(step)
     except OSError:
         pass
     return max(steps, default=None)
