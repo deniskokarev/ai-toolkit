@@ -1,11 +1,15 @@
 """Minimal client for the AI Toolkit UI's HTTP API, shared by the import_* scripts.
 
-The UI (Next.js, default port 3000) owns aitk_db.db, so the scripts go through
-its API rather than writing the database themselves. Environment:
-  AITK_UI_URL       base URL of the UI (default http://127.0.0.1:3000)
+The UI (Next.js) owns aitk_db.db, so the scripts go through its API rather
+than writing the database themselves. Environment:
+  AITK_UI_URL       base URL of the UI (default: the first of
+                    http://127.0.0.1:3000 (dev/systemd) and :8675 (docker image,
+                    `npm run start`) that answers)
   AI_TOOLKIT_AUTH   bearer token, if the UI is password-protected; falls back
                     to the value in ~/.config/ai-toolkit.env (the file the
-                    systemd units load)
+                    systemd units load), then to the container's environment
+                    (/proc/1/environ), where docker/RunPod put it and where an
+                    ssh session does not see it
 """
 import json
 import os
@@ -35,12 +39,46 @@ def _read_env_file(key):
     return None
 
 
+DEFAULT_URLS = ("http://127.0.0.1:3000", "http://127.0.0.1:8675")
+_base_url = None
+
+
+def _answers(url):
+    try:
+        urllib.request.urlopen(url + "/api/settings", timeout=5).close()
+        return True
+    except urllib.error.HTTPError:
+        return True  # it is up, just wants a token
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def base_url():
-    return os.environ.get("AITK_UI_URL", "http://127.0.0.1:3000").rstrip("/")
+    global _base_url
+    if _base_url is None:
+        env = os.environ.get("AITK_UI_URL")
+        if env:
+            _base_url = env.rstrip("/")
+        else:
+            _base_url = next((u for u in DEFAULT_URLS if _answers(u)), DEFAULT_URLS[0])
+    return _base_url
+
+
+def _read_container_env(key):
+    try:
+        with open("/proc/1/environ", "rb") as f:
+            for item in f.read().split(b"\0"):
+                k, _, v = item.decode(errors="replace").partition("=")
+                if k == key:
+                    return v
+    except OSError:
+        pass
+    return None
 
 
 def _auth_token():
-    return os.environ.get("AI_TOOLKIT_AUTH") or _read_env_file("AI_TOOLKIT_AUTH")
+    return (os.environ.get("AI_TOOLKIT_AUTH") or _read_env_file("AI_TOOLKIT_AUTH")
+            or _read_container_env("AI_TOOLKIT_AUTH"))
 
 
 def request(method, path, body=None):
@@ -93,6 +131,28 @@ def list_jobs():
 
 def find_job(name):
     return next((j for j in list_jobs() if j["name"] == name), None)
+
+
+def get_job(job_id):
+    return request("GET", f"/api/jobs?id={job_id}")
+
+
+def start_job(job_id, gpu_ids):
+    """Same as the UI's Start button: queue the job, make sure its GPU queue runs."""
+    request("GET", f"/api/jobs/{job_id}/start")
+    request("GET", f"/api/queue/{gpu_ids}/start")
+
+
+def stop_job(job_id):
+    return request("GET", f"/api/jobs/{job_id}/stop")
+
+
+def gpu_count():
+    """Number of GPUs the UI sees (nvidia-smi or rocm-smi), or None."""
+    try:
+        return len(request("GET", "/api/gpu").get("gpus") or []) or None
+    except UIError:
+        return None
 
 
 def save_job(**fields):

@@ -11,6 +11,10 @@ queued or stopping is never updated.
 
 The job's name becomes config.name, so it trains into
 <TRAINING_FOLDER>/<name> and resumes from any checkpoints already there.
+
+--map-path OLD=NEW (repeatable) rewrites every string in the config that is OLD
+or starts with OLD/ -- e.g. dataset folders when the config was written on
+another machine (scripts/remote/aitk_remote.py uses this).
 """
 import argparse
 import json
@@ -57,6 +61,31 @@ def print_diff(old, new):
         print(f"  {k}: {json.dumps(a.get(k, '<unset>'))} -> {json.dumps(b.get(k, '<unset>'))}")
 
 
+def parse_map(item):
+    old, sep, new = item.partition("=")
+    if not sep or not old or not new:
+        raise argparse.ArgumentTypeError(f"expected OLD=NEW, got {item!r}")
+    return old.rstrip("/") or "/", new.rstrip("/") or "/"
+
+
+def map_paths(obj, maps):
+    """Prefix-rewrite string values (path-component aware); longest OLD wins."""
+    maps = sorted(maps, key=lambda m: len(m[0]), reverse=True)
+
+    def fix(v):
+        if isinstance(v, dict):
+            return {k: fix(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [fix(x) for x in v]
+        if isinstance(v, str):
+            for old, new in maps:
+                if v == old or v.startswith(old + "/"):
+                    return new + v[len(old):]
+        return v
+
+    return fix(obj) if maps else obj
+
+
 def saved_step(path):
     """training_info.step from a safetensors header (no tensor data read), or None."""
     try:
@@ -92,6 +121,8 @@ def main():
     parser.add_argument("-u", "--update", action="store_true", help="update the job if it already exists")
     parser.add_argument("--gpus", help="GPU ids, e.g. '0' or '0,1' (default: keep existing on update, "
                         "else inferred from ddp_devices in the config, else '0')")
+    parser.add_argument("--map-path", metavar="OLD=NEW", action="append", default=[], type=parse_map,
+                        help="rewrite path prefix OLD to NEW in every config string (repeatable)")
     parser.add_argument("name", help="job name")
     parser.add_argument("config", help="config file (.yaml/.yml/.json)")
     args = parser.parse_args()
@@ -103,6 +134,9 @@ def main():
         sys.exit(f"error: cannot read {args.config}: {e}")
     except (KeyError, IndexError, TypeError):
         sys.exit(f"error: {args.config} has no config.process[0]; not an ai-toolkit job config")
+    if args.map_path:
+        cfg = map_paths(cfg, args.map_path)
+        proc = cfg["config"]["process"][0]
 
     try:
         settings = aitk_ui.get_settings()
